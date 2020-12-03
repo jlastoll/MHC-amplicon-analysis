@@ -1,0 +1,509 @@
+---
+title: "MHC1 Analysis in Hawaiian Green Turtles with DADA2- More Conservative Filtering"
+author: "Jamie Adkins Stoll"
+date: "11/23/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+This document is similar to the previous document "dada2HIGT_analysis.pdf", but I increased the stringency of the filtering max error rate to be 0.1, AND I filtered out final variants on a per-sample basis to remove variants that represented less than 5% of total reads for that sample. These filtering steps reduced the total number of variants from 112 to 62. 
+
+This workflow is used to analyze MHC sequencing data generated using a targeted amplicon sequencing library protocol from the Komoroske lab, sequenced on an Illumina Miseq platform with paired end sequencing. More information about dada2 [can be found in this tutorial](https://benjjneb.github.io/dada2/tutorial.html)
+
+The MHC (major histocompatibility complex) is a highly variable region where we expect high sequence diversity between individuals. This workflow uses the Dada2 package to identify unique sequence variants in indivual samples, and outputs an amplicon sequence variant table that records the number of times each amplicon sequence variant is observed in each sample. 
+
+* The input files for this workflow are the demultiplexed fastq files from your sequencing project, with non-biological nucletodies removed (e.g. primers, adapters), and forward and reverse reads in matched order. 
+
+* Prior to input in this workflow, I used demultiplex reads using a custom script, and sickle and scythe packages for adaptor trimming on the command line. 
+
+* The data here were generated from genomic DNA extracted skin bioposies of Hawaiian green sea turtles.
+
+* This R project is located in my local github repository, "MHC_analysis"
+
+## Workflow and Results
+
+### 1.Read in fastq files and examine quality of forward and reverse sequences.
+
+First we inspect the quality scores of our input fastq files, and determine what needs to be trimmed or filtered out prior to using reads for analysis. 
+
+* The first plot displays the sequence quality profile for a single sample, for the forward reads. The average base quality score (depicted as green line) shows that sequence quality on average is high for this sample.
+
+* The second plot displays the sequence quality profile for the sample sample, for the reverse reads. Again, average base quality score is high. I expected this, given that I had previously trimmed my sequences for adaptors and quality, but here I am confirming this worked well. 
+```{r echo=FALSE, warning=FALSE, message=FALSE, include=FALSE}
+library(ggplot2)
+library(dada2) #make SURE you are running most updated version of R because the rcpp package required by dada2 doesn't work in previous version
+library(reshape2)
+#set path to fastq files. Fastq files should contain both mate pair reads in one folder, be demultiplexed, and trimmed of adaptors/non-DNA nucleotides, and unzipped
+path <-"./MHC_HI_fastq/"
+#list.files(path) #make sure path lists all your sample files
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_SS.fastq and SAMPLENAME_R2_SS.fastq
+fnFs <- sort(list.files(path, pattern="_R1_SS.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_SS.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_R"), `[`, 1) #set delimiter to be _R instead of just _ so that I get all sample info in name  up to the R1/R2 designation
+```
+
+
+``` {r echo=FALSE, warning=FALSE, message=FALSE }
+plotQualityProfile(fnFs[1:2]) #look at quality profiles for first 2 samples for just R1reads, mean quality score is always above 30, higher past the first 25bp. indicates good quality trimming
+plotQualityProfile(fnRs[1:2]) #R2 reads also look good, nothing below quality score of 30
+#you can use dada2 to filter and trim, but I've already trimmed my reads with sickle/scythe, just change the path below to indicate that they are filtered
+
+```
+
+### 2. Filter reads
+
+After inspecting the read quality above, we need to filter out reads not meeting a specified quality threshold, as these would introduce bias into called sequence variants downstream. 
+
+* I initially didn't anticipate the need to further filter the reads prior to the next steps since I had already trimmed based on quality, but I found that some sequences still contained "N" bases, and these sequences cannot be used in this program and throw errors.
+* I further filtered reads, setting the maximum number of 'N' bases to 0, and maxEE to 5 for both the forward and reverse reads. The maxEE parameter sets the maximum number of expected errors allowed in a read. 
+* I also set the truncLen parameter to 0 for both forward and reverse reads, which indicates that I do NOT want to truncate my sequences by removing low quality tails. I did not need to truncate reads based on the quality profiles above. 
+
+``` {r echo=FALSE, warning=FALSE, message=FALSE,include=FALSE}
+
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <-sample.names
+names(filtRs) <-sample.names
+out<-filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(0,0),
+                   maxN=0, maxEE=c(0.1,0.1), truncQ=2, rm.phix=TRUE,
+                   compress=TRUE, multithread=FALSE) # On Windows set multithread=FALSE
+plotQualityProfile(filtFs[1:2]) #look at quality profiles for first 2 samples for just R1reads, mean quality score is always above 30, higher past the first 25bp. indicates good quality trimming
+plotQualityProfile(fnRs[1:2]) #R2 reads also look good, nothing below quality score of 30
+
+```
+
+After filtering, the DADA2 algorithm uses a parametric error model for every sample to learn error rates. The error rates for each possible base transition are plotted below.
+
+The important things to note before moving forward are:
+* the estimated error rates (black line) are a good fit to the observed rates (points)
+* the error rates drop with increased quality
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#learn error rates. This takes about 4 minutes to run, especially on windows without multithread
+errF <- learnErrors(filtFs, multithread=FALSE) #32056257 total bases in 200352 reads from 35 samples will be used for learning the error rates
+errR <- learnErrors(filtRs, multithread=FALSE) #32094297 total bases in 200352 reads from 35 samples will be used for learning the error rates.
+plotErrors(errF, nominalQ=TRUE)#plot error rates for each possible nucleotide transition based on quality score. error rates should drop with increased quality, and black line should be good fit to observed points
+plotErrors(errR, nominalQ = TRUE)
+
+
+```
+Given that these points are true for my dataset, and that these plots look very similar to those in the dada2 pipeline tutorial, we can move forward to sample inference.
+
+### 3. Sample inference
+
+Now that we have filtered and trimmed sample reads, and learned error rates, we will use the primary dada2 algorithm for sample inference. Complete details of the algorithm can be found in [Callhan et al. 2016](https://www-nature-com.silk.library.umass.edu/articles/nmeth.3869). In brief, this alogrithm models and corrects for Illumina-sequenced amplicon errors, and infers sample sequences, resolving differences of as little as 1 nucleotide.
+
+#### i. Generate a dada-class object
+
+First, we generate a dada-class object, which holds unique sequence variants for forward and reverse reads.
+``` {r echo=FALSE, warning=FALSE, message=FALSE,include=FALSE}
+### Sample Inference #####
+dadaFs<-dada(filtFs,err=errF, multithread = FALSE)
+dadaRs<-dada(filtRs,err=errF, multithread=FALSE)
+dadaFs[[1]] #dada-class object, 52 sequence variants were inferred from 2020 input unique sequences.Key parameters: OMEGA_A = 1e-40, OMEGA_C = 1e-40, BAND_SIZE = 16
+#above inspection is only for ONE sample- so first sample has 52 true sequence variants from 2020 input sequences
+```
+
+
+#### ii. Merge reads
+
+After creating the dadaclass object that holds the forward and reverse reads, we merge forward and reverse reads to get a full set of denoised samples.
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+### Merge paired reads ###
+#this step will combine F and R reads to get full denoised sequences
+
+mergers <-mergePairs(dadaFs,filtFs,dadaRs,filtRs,verbose = TRUE)
+head(mergers[[1]]) #inspect merge from first sample. shows sequences, abundance of each sequence
+#seeing that MOST reads are merging successfully, though often losing around 800-1000 reads during the merge, and there is One sample where only 254 sequences successfully merged
+#if losing too many reads to merging, might need to change upstream parameters in filtering/trimming
+
+```
+* Parameters can be changed upstream if you find that you are losing too many reads at this merging step, particularly focusing on the truncate length parameter. 
+
+* The "mergers" table displays the sequence variants per sample and abundance of each sequence in a given sample. 
+
+
+I found that most reads are merging successfully, though often I was losing around 800-1000 reads during the merge, and there is one sample where only 254 sequences successfully merged. In the future, I could perhaps used untrimmed fastq files or less-trimmed fastq files for input, perhaps I am losing the overlapping section of forward and reverse reads in some instances. It is also a possibility that for this sample where only 254 reads merged, that there was off-target sequencing so that there were fewer true reads to merge.
+
+#### iii. Construct an amplicon sequence variant table
+
+From the merged reads, we construct a sequence variant table that contains all sequence variants for the entire dataset, and the number of variant copies per sample.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE,include=FALSE}
+seqtab<-makeSequenceTable(mergers)
+#dim(seqtab) #dim are 35 x 478, so 35 samples by 478 sequences
+```
+
+There are 35 samples and a total of 478 sequence variants at this point. These sequence variants will be filtered further in the following steps.
+
+### 3. Filter Called Sequence Variants
+
+#### i. Filter by length
+
+The first filter of sequence variants from the total dataset is by length. First, inspect the length distribution of sequence variants. Sequence variants significantly deviating from the mean or expected sequence length in our study should be removed. Sequences deviating from the expected length significantly are like due to sequencing error or off-target amplification. The exception to this rule is if you were barcoding ITS amplicon sequeces (this does not apply here).
+``` {r echo=FALSE, warning=FALSE, message=FALSE}
+table(nchar(getSequences(seqtab))) #inspect distribution of sequence lengths
+#lenghts vary between 104-223, but 458 of them are at 190bp, which is what I expected
+#can remove longer or shorter sequences than target length. I will do that since very few of these, and they could be due to nonspecific priming or contain errors
+seqtab2<-seqtab[,nchar(colnames(seqtab)) %in% 190]
+#table(nchar(getSequences(seqtab2))) #confirmed, now only has 458 variants with all same length of 190 bp
+```
+
+In this case, most sequences had a length of 190bp, which is exactly what I expected given our amplicon length and sequencing platform. Given that there were so few sequences outside of this length, I chose to filter out all of them, to retain just the sequence variants of 190bp lengths.
+
+
+#### ii. Remove chimeras
+
+The core dada algorithm accounts for indels and sequencing errors, but does not automatically remove chimeric sequences. We will use the removeBimeraDenovo command to do this now.
+```{r echo=FALSE, warning=FALSE, message=FALSE,include=FALSE}
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=FALSE, verbose=TRUE)
+dim(seqtab.nochim) #leaves all 35 samples but only 310 variants remain, which is still a lot. if MOST were removed, might need to change upstream filters
+sum(seqtab.nochim)/sum(seqtab2) #0.899
+
+
+#write.table(seqtab.nochim, "mhc_unfilt_variants.csv",sep=",",row.names = TRUE, col.names = TRUE)
+
+```
+The algorithm identified 148 chimeric sequences out of 458 input sequences, so 89.9% of sequences were retained as non-chimeric sequences.
+
+#### iii. Track reads through pipeline
+
+After these initial filters, we can track read loss through the pipeline. There should be no single step where there is high read loss, but we expect to lose reads at every stage of the pipeline. 
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+### Track reads through pipeline ####
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+# a lot of the loss I'm seeing comes from merging, and then additional loss during chimera removal. But many samples still have greater than 3000 reads
+#might want to go back and revisit merging step, truncation filters
+```
+
+The output table has a row for each sample, and displays the number of reads retained at each point in the pipeline above. For this dataset, I am seeing the most loss at the merging step, and some loss during chimera removal, but most samples still have greater than 3000 reads retained by the end of the filtering steps above. Even at the merging step, the read loss isn't too significant, though it might be worthwhile to alter upstream trimming to try and mitigate loss of reads at the merging step.
+
+
+After the above filters, all 35 samples are retained and there are a total of 310 sequence variants for the dataset. This is still a high number of sequence variants, so I am performing additional filtering steps to decrease the number of sequence variants.
+
+#### iv. Filter out variants present in only one individual
+
+First, I am filtering out any variants that are only being called in one individual. While it is possible that these variants are in fact true, rare variants, this is still a relatively small dataset and we lack confidence that these are true alleles.
+
+The output table "mod_seqtable" contains rows with every sequence variant, and columns of individual samples, with columns on the far right showing the sum of individuals with a given sequence variant, and the total number of reads in support of a sequence variant across individuals. 
+
+```{r echo=FALSE, warning=FALSE, message=FALSE,include=FALSE}
+#the dada tutorial doesn't go into this, but basing this on stervander paper
+# "For an allele to be called in an individual, its effective coverage had to meet either (a) a threshold value of 10% of the average coverage for that allele for samples in which it was present, or (b) a threshold value of within-individual read frequency of 5% (i.e. >5% of all reads in that individual had to belong to that allele).
+
+mod_seqtable<-seqtab.nochim
+library(tidyverse)
+
+#want to filter out variants only present in ONE sample
+#as.tibble(seqtab.nochim)
+mod_seqtable<-as.data.frame(t(as.matrix(seqtab.nochim))) #flip the dataframe so samples are cols and rows are variants, makes it easier to work with in dplyr
+#as_tibble(mod_seqtable)
+mod_seqtable$sums<- apply(mod_seqtable,1, function(i) sum(i>0)) #add column to dataframe showing how many samples have this variant
+mod_seqtable<-filter(mod_seqtable,sums>1) #keep only variants that are present in more than 1 sample, leaves 171 variants
+mod_seqtable$total_calls<-apply(mod_seqtable,1, function(i) sum(i))
+#mod_seqtable
+#reads_by_samp<-as.data.frame(sum_reads_by_samp[c(1:35)],sample.names)
+
+```
+
+I also removed one sample from the analysis that appears to have failed on merging.
+
+``` {r echo=FALSE, warning=FALSE, message=FALSE,include=FALSE}
+as.tibble(seqtab.nochim)
+mod_seqtable<-as.data.frame(t(as.matrix(seqtab.nochim))) #flip the dataframe so samples are cols and rows are variants, makes it easier to work with in dplyr
+as_tibble(mod_seqtable)
+
+sum_reads_by_samp<-apply(mod_seqtable,2,function(i) sum(i)) #count total number of reads per sample
+mod_seqtable$sums<- apply(mod_seqtable,1, function(i) sum(i>0)) #add column to dataframe showing how many samples have this variant
+
+mod_seqtable$sums
+mod_seqtable<-filter(mod_seqtable,sums>1) #keep only variants that are present in more than 1 sample, leaves 171 variants
+dim(mod_seqtable) #there actually weren't any variants in only one sample, so still have 181 variants
+mod_seqtable$total_calls<-apply(mod_seqtable,1, function(i) sum(i))
+
+
+reads_by_samp<-as.data.frame(sum_reads_by_samp[c(1:35)]) #put reads per sample in a dataframe with sample names
+  
+failed_samples<-ifelse (reads_by_samp<1000,"fail","pass") #consider failed samples as those than have fewer than 1k reads
+failed_samples<-as.data.frame(failed_samples,stringsAsFactors = FALSE) #convert from character class to dataframe for filtering
+failed_samples<-filter(failed_samples, grepl("fail",`sum_reads_by_samp[c(1:35)]`)) #get list of failed samples
+failed_samp_names<-row.names(failed_samples)  
+#remove failed samples
+mod_seqtable<-mod_seqtable[, !(names(mod_seqtable) %in% failed_samp_names)] #remove columns for sample that failed on merging
+
+
+
+```
+
+At this point, 34/35 individuals remain. 
+
+#### v. Filter out variants calls in individuals with less than 100 reads AND removing variants with less than 5% of reads in an individual
+
+I then removed variant assignments in individuals where there were fewer than 100 reads supporting that assignment. For individuals with 5000 total reads, that would mean removing variant assignments that comprised less than 2% of total reads. This is similar to filtering done in Stervander et al. where assignments were removed if the supporting reads were less than 5% of total reads for an individual. 
+
+
+I also filtered out variants on a per-sample basis, removing variants that made up less than 5% of total reads for an individual sample. 
+
+
+#### vi. Summary statistics
+
+We can see the frequency distribution of variants within this dataset:
+
+
+``` {r echo=FALSE, warning=FALSE, message=FALSE}
+#filter out allele calls in individuals with less than 100 reads supporting that alleles perhaps? that would be a threshold of 2% frequency for a sample with 5000 reads
+mod_seqtable[]<- lapply(mod_seqtable,function(x) ifelse(x<100, 0, x)) #change calls to 0 if less than 100 supporting an allele
+mod_seqtable$sums<- apply(mod_seqtable,1, function(i) sum(i>0)) #add column to dataframe showing how many samples have this variant
+mod_seqtable<-filter(mod_seqtable,sums>2) #same as above, redoing now that more cells have a 0 value. also have extra col with value that is counted in sum, so putting 2 here is same as 1 above.leaves 112 variants still
+mod_seqtable<-mod_seqtable[, names(mod_seqtable) != "MHC_Sample21_cm_Oahu"] #remove column for sample that failed after further filtering
+
+
+
+
+#table of frequency of each variant per individual - need total reads per individual, and proprotion of reads in support of each variant per individual
+
+seq_matrix<-as.matrix(mod_seqtable)#convert df to matrix to use prop table below
+freq_matrix<-prop.table(seq_matrix,2) #for each variant in a sample, get the proportion of reads supporting that variant from total reads per individual
+#replace all values with less than 0.03 proportion with 0, then recalculate sums for each variant, then filter variants
+freq_matrix<-as.data.frame(freq_matrix)#convert back to dataframe
+freq_matrix[]<-lapply(freq_matrix, function(x) ifelse(x<0.05, 0, x))
+freq_matrix<-freq_matrix[c(1:34)]#remove last 3 columns that had sums/old frequency calcs
+freq_matrix$sums<- apply(freq_matrix,1, function(i) sum(i>0))#add column with sums of number of samples per variant
+freq_matrix<-filter(freq_matrix,sums>1) #only keep variants in table if present in at least one individual
+#this results in 60 variants 
+
+
+#subset count table to only include these 73 variants
+final_var_list<-row.names(freq_matrix)
+mod_seqtable<-mod_seqtable %>% rownames_to_column("row_names")
+mod_seqtable2<-mod_seqtable[(mod_seqtable$row_names %in% final_var_list),]
+row.names(mod_seqtable2)<-mod_seqtable2$row_names #convert row names back
+mod_seqtable2<-mod_seqtable2[c(2:34)]#get rid of old sums and old row name column
+mod_seqtable2$total_calls<-apply(mod_seqtable2,1, function(i) sum(i))
+mod_seqtable2$sums<- apply(mod_seqtable2,1, function(i) sum(i>0))#add column with sums of number of samples per variant, REMEMBER that this column has one extra count in it because it is including the total calls column in count
+
+
+
+
+
+#write.csv(mod_seqtable2,"filt_seq_table_trimreads.csv")
+
+#get column of frequency in dataset for each variant
+total_reads<-sum(mod_seqtable$total_calls) #101231 total reads
+mod_seqtable$variant_freq<-mod_seqtable$total_calls/total_reads*100
+
+
+ggplot(mod_seqtable,aes(variant_freq))+
+  geom_density()
+
+#mean(mod_seqtable$variant_freq) #0.89
+#min(mod_seqtable$variant_freq) #0.26
+#max(mod_seqtable$variant_freq) #3.01
+#median(mod_seqtable$variant_freq) #0.69
+```
+
+Most sequence variants exist at low frequency within this dataset. Six variants appear to be "high frequency" which I am considering as those with greater than 2% frequency in the dataset. 
+
+For the total number of variants being assigned to each individual, I summed the number of variants with reads supporting it each individual.
+``` {r echo=FALSE, warning=FALSE, message=FALSE,include=FALSE}
+
+no_alleles<-apply(mod_seqtable2,2,function(x) sum(x>0)) #get number of alleles per individual
+no_alleles<-no_alleles[c(1:33)] #only keep allele numbers for first 34 columns which are the samples
+no_alleles<-as.data.frame(no_alleles)
+
+min(no_alleles$no_alleles) #1
+max(no_alleles$no_alleles) #26
+mean(no_alleles$no_alleles)#13
+
+```
+
+
+
+Below is the distribution of sequence variants per individual.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+
+ggplot(no_alleles,aes(no_alleles))+
+  geom_bar()+
+  xlab('Number of sequence variants per individual')+
+  ylab('Count Frequency')+
+  theme_minimal()
+
+```
+
+
+
+## Nucleotide diversity
+
+I used the MHCtools package to quantify sequence divergence in a pairwise fashion for all sequence variants, and also get a value of mean sequence divergence per sample.
+
+In MHCtools, I calculated pairwise distances using the DistCalc function, and distance type='P'. There are other distance metrics that can be used, but p distance is the proportion of nucleotide sites at which two sequences are different, or the number of nucleotide differences divided by the number of nucleotides compared. A p-distance of 1 would indicate two sequences were entirely different from each other at every position, whereas a value of 0 would indicate identical sequences. 
+
+The output of this funtion are two csv files; one is a matrix of p-distances of all sequence comparisons, and the other is the mean p-distance per sample.
+``` {r echo=FALSE, warning=FALSE, message=FALSE}
+library(MHCtools)
+library(tidyverse)
+library(seqinr)
+## calculate p-distances from pariwsie sequence comparisons
+#requires sequence table from dada2 output with samples in rows and sequence variants in columns
+
+#read in sequence table from dada
+mod_seqtable<-read.csv("./HI_dada_outputs/filt_seq_table.csv")
+rownames(mod_seqtable)<-mod_seqtable$X #set rownames
+mod_seqtable<-mod_seqtable[c(2:35)] #keep only columns with sample names
+
+#transpose filtered table so that it meets input requirements
+table_for_pdist<-mod_seqtable
+matrix_for_pdist<-t(table_for_pdist)
+
+
+#calculate p distance between nucleotide sequences for all samples in  a csv file, also shows mean p distance for each sample(?)
+#p-distance is proportion of nucleotide sties at which two sequences are different, or the number of nuceltoide differences divided by the number of nucleotides compared. 
+#so a proportion closer to 1 is MORE DIFFERENT sequences, if value is 0 then they are the same
+DistCalc(matrix_for_pdist,path_out = "./",input_seq="nucl",dist_type = 'P')
+
+#this ran really quickly
+#outputs similarities as "sequence 1" sequence 2" etc, and not sure how these match up to the actual sequences, is it by column order?
+#i think the mean distance for each sample is on average how closely related called sequences are? so samples with hiegher p-dist have more different alleles in thier genome than others>
+#this outputs its own csv
+```
+
+Then I looked at density of mean distances per individual. On average, individuals had a mean p-distance of 0.15, indicating most indivduals had low sequence variation. However, the maximum was 0.24 and the minimum was 0.036, so there are at least some individuals with relatively high sequence diversity as well as some with very low sequence diversity. 
+
+Sequence 1 (the most frequent in the population by total number of reads) was highly similar to sequences 7,8,10, and 13 (p-dist around 0.005) but there were more than one nucleotide difference between these sequences so it seems unlikely that variants were called erroneously. In individuals with sequence 1, these other variants were often also present.
+
+Sequence 2 occurred in the highest number of individuals and was most similar (p-dist around 0.005) to sequences 9, 31, 33
+
+I did try looking at mean p-distance by location within the Hawaiian islands, but found this was not that informative due to very different sample sizes by location (FFS only has 2 samples in this dataset) and this likely contributed to differences observed in mean p-distance by location. Also, there does not seem to be a good biological reason to separate samples by location in this way. However, we can take from this I think that increasing sample sizes does appear to modestly increase the mean p-distance per indivdiual.
+
+
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#plot sequence similarity
+dist_matrix<-read.csv("./HI_dada_outputs/dist_matrix_20201001.csv")
+indiv_meanp<-read.csv("./HI_dada_outputs/mean_dist_table_20201001.csv")
+#mean(indiv_meanp$mean_dist) #0.15
+#max(indiv_meanp$mean_dist) #0.24
+#min(indiv_meanp$mean_dist) #0.036
+
+
+ggplot(indiv_meanp,aes(mean_dist))+
+  geom_density()
+
+#plot density of mean distances per individual
+
+
+#plot indiv mean density by location
+vars<-colsplit(indiv_meanp$X,'_',c("locus","Sample","species","location"))
+vars
+mod_meanp<-cbind(vars,indiv_meanp) #bind vars above to the dataframe with mean pdist
+mod_meanp<-mod_meanp[c(1:4,6)] #get rid of sample name column
+
+ggplot(mod_meanp,aes(location,mean_dist))+
+  geom_boxplot()
+#interesting, mean dist per individual is lower in EastFFS samples. BUT only have two samples from this location, so not that informative, although the number of reads in these two samples is comparable to many other samples
+
+```
+## Amino acid diversity
+
+Using MHCtools, I converted the list of sequence variants to a fasta file. The sequences (1-112) are ordered by total allele calls in the dataset. I used Transdecoder on the command line to identify the longest open reading frame for the sequences and translate nucleotides to amino acids sequences. The longest ORF corresponded to ORF2(+) and ORF(-). I manually tested alternate ORFs but found all ORF1 and ORF3 were nonsensical and contained numerous gaps. Based on the length of the sequence and the lack of stop/start codons, ORF2 is the most appropriate ORF for this analysis.I used the ORF2(+) strand rather than (-) as this should be the 5'-3' sequence direction. 
+
+I used [ScoreCons](https://www.ebi.ac.uk/thornton-srv/databases/cgi-bin/valdar/scorecons_server.pl) (as in Stiebens et al. paper characterizing MHC in loggerheads) to get a measure of conservation at each codon when evaluating all sequences in the dataset.Diversity of position scores (or “Dops”) considers the number of different scores in the alignment and the relative frequency of each score.
+
+- the overall diversity of position score was 72.4%. This was done by comparing all sequences in the dataset to the first sequence in the dataset
+- Default parameters were used for ScoreCons, except I adjusted the gaphila penalty from 0 to 0.5 to lessen the penalty for codon gaps in some sequences, since I wanted to consider a gap in sequence as a variable position.I used the valdar01 score method, as this accoutns for both variation in residue identity as well as stereochemical diversity at a given position. 
+
+
+I recreated the figure from Stiebens et al. 2013 to see levels of amino acid variation by residue. Here the Y axis "Amino Acid Variation" corresponds to 1- the ScoreCons score for that position. ScoreCons gives a score to each position based on how conserved the residue is, so a value of 1 would indicate that the residue is the same (highly conserved) in all sequnences. Here I want to see how variable a residue is, so a value of 1 would indicate completely different for each sequence. 
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+
+#look at diversity using ORF2:
+aa_scores_orf2<-read.table("./HI_dada_outputs/ORF2_scorecons_diversity.txt")
+aa_scores_orf2$position<-row.names(aa_scores_orf2)
+colnames(aa_scores_orf2)<-c("diversity","ref.codon","alt.codons","position")
+aa_scores_orf2$variation<-1-aa_scores_orf2$diversity #this indicates a score of 1 where the codon is completely different for every individual, and a score of 0 for codons that are completely the same for everyone
+#scorecons rates each position on the CONSERVATION of the residue, so when a codon is highly conserved (the same in every individaul) this score is closest to 1, meaning no diversity.
+#i set scorecons to calculate this based on alignment to the first sequence in the dataset tso that it would skip gaps in sequence
+
+
+aa_scores_orf2$position<-factor(aa_scores_orf2$position, levels=aa_scores_orf2$position) #set factors so that ggplot goes in order
+ggplot(aa_scores_orf2,aes(position,variation))+
+  geom_bar(stat='identity')+
+  theme_bw()+
+  xlab("Residues of the MHC1 a1 molecule")+
+  ylab("Amino Acid Variation")
+```
+
+## Tests for selection
+
+In Stiebens et al. 2013, the authors also performed tests for selection in the region, as well as by individual residue.
+
+-I have not yet explored how to do this by residue, but I did run a quick test for the entirety of the region using the [MEGAX GUI](https://www.megasoftware.net/). The input here was the fasta file of all sequence variants in nucleotide format. 
+
+- As in the Stiebens paper, I tested for signatures of neutral and positive selection following the method of Nei and Gojobory with the Jukes-Cantor correction for multiple substitutions. The rate ratio dN/dS was tested for significant deviation from one using a Z-test. The basis of this is that "under positive selection, a relative excess of non-synonymous over synonymous substitutions is expected."
+
+- When testing the hypothesis of neutral selection, the overall probability was 0.37, indicating it would be inappropriate to reject the null hypothesis that synonymous and nonsynomous substitutions are equal
+
+- Similarly, when testing the alternate hypothesis of positive selection, the overall probability is 0.18, again indicating that we cannot reject the null hypothesis
+
+- When testing for purifying selection, the overall probability is 1.0, so we definitely cannot reject the null hypothesis in this case.
+
+- I have not yet found a way to test directly for balancing selection, but think that is most likely what is occurring within this dataset
+
+
+
+
+## Network analysis of haplotype sequences
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#Only keep sequence names and total read count from above in new dataframe
+mod_seqtable2<-rownames_to_column(mod_seqtable2,var="rowname")
+abund_tab<-mod_seqtable2[c(1,35)]
+colnames(abund_tab)<-c("sequence","abundance")
+library(ShortRead)
+library(pegas)
+library(ape)
+library(seqinr) #make vector of ALL dereplicated sequences based on abundance
+for (i in length(abund_tab)) {
+  seqs.re_replicated<-rep(abund_tab$sequence,times=abund_tab$abundance)
+}
+
+writeFasta (seqs.re_replicated,file="./derepseqs.fasta") #write all dereplicated sequences to fasta file for network analysis
+
+
+
+read.dna("./derepseqs.fasta",format = "fasta")->chmy_seqs #read in fasta file as a DNAbin frame, 33973 sequences
+chmy_seqs #all seqs 190bp, stored in matrix, gets base composition for each base
+
+
+chmy_haps<-haplotype(chmy_seqs)
+chmy_haps #61 haplotypes, gives haplotype labels and frequencies (except in this case all frequencies are 1 since i'm loading only the unique sequences rather than all copies of sequences)
+
+chmynet<-haploNet(chmy_haps)
+plot(chmynet,size=attr(chmynet,"freq"), scale.ratio = 2, cex = 0.8, fast=FALSE,show.mutation=2) #can make it so that circle correspond to circle frequency, but I didn't do that since all freqs are the same
+
+#get sequences corresponding to roman numeral labels:
+h<-haplotype(chmy_seqs)
+dna_seqs<-write.dna(h,"haplotypes.txt",colsep = "\t",colw = 190) #colw needs to be 190 to get all of dna seq on one line
+hap_seqs<-read.table("haplotypes.txt",header = T)
+colnames(hap_seqs)<-c("Haplotype_ID","DNA-seq")
+hap_seqs
+```
+
+## Future ideas
+- Figure out how to test for balancing selection, selection at specific codons
+- Linear model of age class as it relates to individual mean p-distance (look at age structure of MHC region and whether diversity has increased over generations)
+- Compare within-individual diversity and copy number to tumor score if/when available
+- Linear model of nucleotide diversity as it relates to copy number within an individual 
+- can I do network analysis by individual? Is the above network analysis helpful?
