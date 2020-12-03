@@ -2,7 +2,7 @@
 Analysis of targeted amplicon sequencing data with DADA2
 
 
-This repository contains an R project file for the complete analysis, as well as an updated pdf document outlining this workflow and expected results in detail. 
+This repository contains an R project file (made in R version 4.0.3) for the complete analysis, as well as an updated pdf document outlining this workflow and expected results in detail. 
 The PDF can be recreated with the dada2_HIGT_analysis-primer-trimmed.rmd file.
 There are two additional .rmd files: the first dada2_HIGT_analysis.rmd uses the least amount of filtering, and primers were not entirely trimmed here. The second is dada2_HIGT_analysis-stricter-filtering.rmd which also still includes primers, but implements the stricter filters present in the file workflow. I've included both to document various methods we tried and how these impact results.
 
