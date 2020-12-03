@@ -12,3 +12,4 @@ When cloning this repository, make a folder within your local repository that co
 
 The workflow in the dada2_HIGT_analysis-primer-trimmed.rmd and dada2_MHC.R files both contain the final workflow we decided on. 
 This should run easily just by changing the fastq input files at the beginning of the workflow, with the exception of the section on amino acid analysis. For this analysis section, data from the ScoreCons program needs to be pulled in and is not generated in R.
+There are a few points throughout the script where the column subsetting values needs to be changed based on the number of samples in the dataset.
